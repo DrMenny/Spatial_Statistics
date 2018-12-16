@@ -1,0 +1,172 @@
+---
+title: "Inverse Distance Weighting Algorithm - Spatial Statistics and Statistical Tools for Environmental Data"
+author: "Andrea Pisani"
+date: "2018"
+output: html_document
+---
+
+### Libraries
+
+```{r libraries, message=FALSE, warning=FALSE, cache=T}
+require(fields)
+library(geoR)
+library(spatstat)
+library(ggplot2)
+library(plotly)
+```
+
+### Wolfcamp data
+
+Wolfcamp data comes from Piezometric head measurements taken at the Wolfcamp Aquifer, Texas, USA. Coordinates are given in kilometers and pressure heads to meters.
+
+The first step before analyzing the data is the creation of a dataframe, useful for the Inverse Distance Weighting function.
+
+```{r cars, cache=T}
+data(wolfcamp)
+mydata = data.frame(wolfcamp$coord[,1],wolfcamp$coord[,2],wolfcamp$data)
+colnames(mydata) = c("x","y","value")
+cat("points in the dataset: ", nrow(mydata))
+summary(mydata)
+```
+
+### Plots
+
+The next plot is a visualization of the data in the bidimensional space. The size of the points is proportional to their values and also the color is giving an intuition of their approximate values.
+
+```{r plots, cache=T}
+ggplot(mydata) +
+  geom_point(aes(x=x, y=y, col=value, size=value)) +
+  scale_colour_gradient(low = "black", high="orange") +
+  ggtitle("wolfcamp data")
+```
+
+### IDW - LOO Cross Validation
+
+In order to implement the Inverse Distance Weighting method, the value of the smoothing parameter $p$ must be chosen. The Leave-one-out Cross Validation is used to chose the best $p$.
+
+```{r loo cv, cache=T}
+#the function needs the values and the position of the points, and a value of the smoothing parameter p. The return is the CV coefficient for that specific p.
+idw.eval.loo <- function(value, position, p) {
+  #this vector contains all the terms to evaluate the CV coefficient.
+  partial.sum = rep(0,length(value))
+  
+  #the for cycle remove one point in our dataset, in order to estimate it.
+  for (i in 1:length(value)) {
+    #the distance matrix computes the distance between the point leaved out and and the rest of the points in our dataset. It's a function in the "fields" package.
+    dist.mat = rdist(position[,1:2], position[i,1:2])
+    
+    #coefficients used to estimate the point
+    coef = 1/(sum(dist.mat[-i]^(-p)))
+    weight.coef = sum((dist.mat[-i]^(-p))*value[-i])
+    
+    #estimate of the value
+    est = coef*weight.coef
+    
+    #single term needed to evaluate the CV coefficient
+    partial.sum[i] = ((est-value[i])/(sd(value[-i])))^2
+  }
+  #the function returns the value of each CV coefficient
+  return(CV = sum(partial.sum)/length(value))
+}
+```
+
+### IDW - LOO Cross Validation results
+
+In order to find the best value of the smoothing parameter $p$, the argmin of the CV vector obtained using the idw function must be computed.
+
+```{r min p, cache=T}
+#range of value of p to evaluate
+p = seq(0,5,0.02)
+print(length(p))
+#loo function. sapply is used to parallelize the process for multiple values of p. ptm is the process time, used to evaluate the time to compute the function.
+ptm <- proc.time()
+cv_coeff = sapply(p, idw.eval.loo, value=mydata[,3], position=mydata[,1:2])
+print(proc.time() - ptm)
+#p with the minimum CV coefficient
+p.min = p[match(min(cv_coeff), cv_coeff)]
+#minimum p
+print(p.min)
+#dataframe used for the plot
+res = data.frame(p, cv_coeff)
+
+ggplot(data = res, aes(x=p, y=cv_coeff)) +
+  geom_line(col="orange", lwd=0.5) +
+  ggtitle("CV coefficients") +
+  geom_vline(aes(xintercept=p.min), lwd=0.5, col="brown") +
+  annotate(geom="text", x=3.4, y=0.2, label="p_min = 3.84", col="brown")
+```
+
+### Grid Evaluation
+
+In the next chunk of code a 20x20 grid is created, taking into account the maximum and minimum values of the wolfcamp data coordinates.
+
+```{r grid_creation, cache=T}
+#window to create the grid
+w <- owin(c(-233.72,181.53), c(-145.79,136.41))
+#creation of points inside the window
+grid <- gridcenters(w, 20,20)
+grid <- data.frame(grid$x, grid$y)
+#comparison of the coordinates of the grid vs the wolfcamp data
+summary(grid)
+summary(mydata)
+```
+
+The next function is used to evaluate the value of each point in the grid.
+
+```{r grid_evaluation, cache=T}
+idw.eval <- function(value, position, pos.target, p) {
+  est.values = rep(0, length(pos.target[,1]))
+  
+  for(i in c(0:length(est.values))) {
+    target = grid[i,1:2]
+    dist.mat = rdist(position[,1:2], target)
+    
+    coef = 1/(sum(dist.mat^(-p)))
+    weight.coef = sum((dist.mat^(-p))*value)
+  
+    est.values[i] = coef*weight.coef
+  }
+  return(est.values)
+}
+
+#estimate of each point in the grid
+estimate = idw.eval(mydata[,3],mydata[,1:2], grid, p.min)
+grid = cbind(grid, estimate)
+colnames(grid) = c("x", "y", "estimate")
+```
+
+### Results
+
+In the next plots there's a visual comparison of the grid values with respect to the wolfcamp data.
+
+```{r results, cache=T}
+ggplot(mydata) +
+  geom_point(aes(x=x, y=y, col=value, size=value)) +
+  scale_colour_gradient(low = "black", high="orange") +
+  ggtitle("wolfcamp data")
+
+ggplot(grid) +
+  geom_point(aes(x=x, y=y, col=estimate, size=estimate)) +
+  scale_colour_gradient(low = "black", high="orange") +
+  ggtitle("estimated grid")
+
+#Both data in the same plot
+ggplot() +
+  geom_point(data=mydata, aes(x=x, y=y, col=value, size=value)) +
+  geom_point(data=grid, aes(x=x, y=y, col=estimate, size=estimate)) +
+  scale_colour_gradient(low = "black", high="green") +
+  ggtitle("wolfcamp data + estimated grid")
+
+#3D plot
+mat = matrix(grid$estimate, ncol=20)
+x = unique(grid$x)
+y = unique(grid$y)
+#A log scale is used in order to have a more compact z axis
+z = log(mat/min(mat))
+plot_ly(x= ~x, y= ~y, z = ~t(z)) %>% add_surface()
+```
+
+
+
+
+

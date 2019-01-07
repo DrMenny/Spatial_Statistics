@@ -1,0 +1,17 @@
+base
+RevoUtilsMath
+RevoUtils
+geoR
+ggplot2
+nlme
+mgcv
+coda
+abind
+magic
+Formula
+spBayes
+MBA
+dotCall64
+spam
+maps
+fields

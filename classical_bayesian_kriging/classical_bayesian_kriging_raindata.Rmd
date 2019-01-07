@@ -1,0 +1,802 @@
+---
+title: "Classical and Bayesian Kriging applied - Rain dataset"
+author: "Andrea Pisani"
+output: html_document
+---
+
+## Libraries
+
+```{r libraries, message=FALSE, warning=FALSE}
+library(geoR)
+library(ggplot2)
+library(mgcv)
+library(spBayes)
+library(MBA)
+library(fields)
+```
+
+## Rain data
+
+The "datipioggia" dataset contains the survey about the total annual rain expressed in millimeters, in the italian Hydrological Basin of Catanzaro (Comparto Idrologico di Catanzaro) in Italy. The data are registered from 1970 to 1982, but only 1978 and 1981 will be considered for the spatial analysis and the comparison.
+
+The main goal of the statistical analysis is the prediction on unobserved locations in a grid covering the Basilicata and Calabria regions, meaning that we have to infer the total annual rain value for each point.
+
+```{r}
+### Import data 1978, 1981
+load("datipioggia.RData")
+load("quota32.RData")
+
+### Structure of the dataset
+str(dati)
+```
+
+To develop a prediction the variables needed are Regione (region), YUTM, XUTM, Quota (the height), anno (year) and totanno. The last one contains the totalrain in mm measured in each observatory.
+
+The coordinates are given in UTM (Universal Transverse Mercator) coordinate system, a projection that allows us to use the locations in a 2-dimensional Cartesian space, with no need to consider the earth curvature.
+
+In the UTM coordinate system the earth surface is divided in 60 zones, each of 6° of longitude in width. Each of the 60 zones uses a transverse Mercator projection that guarantess low distorsions. The Hydrological Basin of Catanzaro is in the zone 33.
+
+In the datasets "Cal" and "Bas" there are the points to draw the contour of the 2 regions considered in the analysis: Calabria and Basilicata.
+
+```{r}
+calabria = Cal[-1]/1000
+colnames(calabria) = c("x", "y")
+
+basilicata = Bas[-1]/1000
+colnames(basilicata) = c("x", "y")
+```
+
+The grid of points to estimate in the 2 regions are in the Calabriaquota32 and Basquota32 databases. The analysis is performed considering kilometers instead of meters, to avoid computational problems (e.g. in the matrix inversion computed using Ordinary Kriging algorithm).
+
+```{r}
+### Grid
+cal.grid = Calabriaquota32[,2:4]
+cal.grid[,1:3] = cal.grid[,1:3]/1000
+colnames(cal.grid) = c("x", "y", "z")
+
+bas.grid = Basquota32[,2:4]
+bas.grid[,1:3] = bas.grid[,1:3]/1000
+colnames(bas.grid) = c("x", "y", "z")
+
+### Merging the 2 grid
+grid = rbind(cal.grid[1:3], bas.grid[1:3])
+```
+
+```{r echo=FALSE}
+ggplot() +
+  geom_path(data=calabria, aes(x=x, y=y), size=0.9, col="black") +
+  geom_path(data=basilicata, aes(x=x, y=y), size=0.9, col="black") +
+  geom_point(data=grid, aes(x=x, y=y), col="grey") +
+  labs(title="Grid", x="x (km)", y="y (km)") +
+  theme_bw()
+```
+
+## Year 1978 
+
+The next R chunk contains the creation of the dataset relative to the year 1978, for the regions Basilicata and Calabria (Puglia region is not included). The spatial data are converted from meters to kilometers and the variables not needed are discarded.
+
+```{r}
+### dataset 1978
+data.1978 = data.frame(dati$XUTM, dati$YUTM, dati$Quota, 
+                      dati$totanno, dati$anno, dati$Nome_Regione)
+colnames(data.1978) = c("x", "y", "z", "value", "year", "regione")
+
+### extracting rows for 1978, Puglia and Calabria
+data.1978 = data.1978[which((data.1978[5]==1978) & 
+                      (data.1978[6]=="Basilicata" | data.1978[6] =="Calabria")),]
+
+### deleting year and region columns, useless for the analysis
+data.1978 = data.1978[-c(5,6)]
+data.1978[,1:3] = data.1978[,1:3]/1000
+row.names(data.1978) = NULL
+str(data.1978)
+
+### Creating Geodata
+geo.data.1978 = as.geodata(obj=data.1978,
+                           coords=c(1,2),
+                           data.col=4,
+                           covar.col=3,
+                           covar.names=c("z"))
+```
+The evaluation of the points in the grid has to be done using the black points showed in the next plot.
+
+```{r echo=FALSE}
+### Grid with dataset
+ggplot() +
+  geom_path(data=calabria, aes(x=x, y=y), size=0.9, col="black") +
+  geom_path(data=basilicata, aes(x=x, y=y), size=0.9, col="black") +
+  geom_point(data=grid, aes(x=x, y=y), col="grey") +
+  geom_point(data=data.1978, aes(x=x, y=y), col="black", size=0.9) +
+  labs(title="Grid + Dataset", x="x (km)", y="y (km)") +
+  theme_bw()
+```
+
+The next plot shows the spatial coordinates $x$ and $y$ of each point in the dataset while color and size are used to have a qualitative knowledge of the rain distribution in the regions.
+
+```{r echo=FALSE}
+ggplot() +
+  geom_path(data=calabria, aes(x=x, y=y), size=1, col="grey") +
+  geom_path(data=basilicata, aes(x=x, y=y), size=1, col="grey") +
+  geom_point(data=data.1978, aes(x=x, y=y, col=value, size=value)) +
+  scale_color_viridis_c(limits=c(0,2600))+
+  labs(title="Rain dataset 1978", x="x (km)", y="y (km)", fill="mm",
+       caption="rain value expressed in mm") +
+  theme_bw()
+```
+
+### The Model
+
+This is the model we will use for the Kriging algorithm:
+
+$$
+P(x,y,z) = \beta_0 + z \cdot \beta_1 + W(x,y) + \epsilon(x,y,z)
+$$
+
+where $\beta_0 + z \cdot \beta_1$ is the deterministic part with respect to the height, $W(x,y)$ is the stationary spatial process and $\epsilon(x,y,z)$ is the measurement error.
+
+### Normality Test
+
+First of all, we need to check if the 1978 dataset has a normal distribution, because we are assuming that the spatial process is gaussian. We'll use the Shapiro-Wilk test, which is robust for spatially dependent data, and the Q-Q plot.
+
+```{r echo=TRUE, message=FALSE, warning=FALSE, paged.print=FALSE}
+### Shapiro-Wilk Test 
+shapiro.test(data.1978$value)
+qqnorm(data.1978$value)
+qqline(data.1978$value)
+```
+
+The p-value is very low and also the Q-Q plot shows that the behaviour of our dataset is not really gaussian. 
+
+We perform the same analysis on the residuals of a simple linear regression model of the value (rain in mm) in the logarithmic scale with respect to the height.
+
+The choice of the height in the regression comes from the physical process called orographic lift. This occurs when an air mass, with high concentration of moisture, is forced from a low elevation to a higher elevation as it moves over the rising terrain: the higher is the difference in altitude, the more the air mass quickly cools down adiabatically (without trasferring heat). This process raises the relative level of humidity and can create clouds and also precipitation.
+
+The regions Calabria and Basilicata have the right elements for the orographic lift: a steep gap between the coast and the mountain.
+
+```{r}
+### Mean estimation
+model1 = lm(log(value) ~ z, data = data.1978)
+summary(model1)
+rr1 = model1$residuals
+
+### Shapiro-Wilk Test on residuals
+shapiro.test(rr1)
+qqnorm(rr1)
+qqline(rr1)
+```
+
+As the Shapiro-WIlk test and the Q-Q plot show, the behaviour of the residuals is approximately normal.
+
+## Ordinary Kriging 1978
+
+The Ordinary Kriging method is a method of interpolation that uses a Gaussian process governed by a prior covariance. Each point of the grid in the Calabria and Basilicata regions will be evaluated computing a weighted average of the known values in the neighborhood of the point.
+
+### Variogram
+
+A covariance function is needed for the Ordinary Kriging algorithm: a variogram can help to find a simple structure. 
+
+The Variogram is a function that describes the spatial dependence of a stochastic process. It express the variation on samples with respect to the distance of those samples from each other.
+
+In order to use the Ordinary Kriging we need to find the covariance structure and its parameters by inspection of the variogram. After choosing the covariance function we need three parameters: nugget, sill and range. The nugget $\tau^2$ is the number related to the short range variability in the data (measurement error), the range $\phi$ is the distance after which data are no longer correlated and the sill $\sigma^2$ is the distance value where the variogram reaches the plateau value.
+
+```{r echo=FALSE}
+### Variogram
+max.dist = max(dist(data.1978[,1:2]))
+vv = variog(geo.data.1978,
+            trend = ~geo.data.1978$covar$z,
+            uvec=seq(0, 0.3*max.dist, length=20),
+            lambda=0,
+            messages=F)
+### Plot
+plot(vv, type="b", lwd=2)
+abline(h=0.14, col="darkred", lwd=2, lty=2)
+text(10,0.15, "sill")
+abline(h=0.025, col="darkred", lwd=2, lty=2)
+text(10,0.035, "nugget")
+abline(v=70, col="darkred", lwd=2, lty=2)
+text(75,0.1, "phi")
+#curve(Exponential(x,phi=0.15,d=20)+0.03,col="orchid", lwd=2, add=T)
+title("Variogram")
+```
+
+A first order trend on the height is used to estimate the log-mean of the process so the variogram will be computed only for the log of the residuals.
+
+$$
+log(value) = \beta_0 + z \cdot \beta_1
+$$
+
+```{r}
+### Variogram of the residuals
+max.dist = max(dist(data.1978[,1:2]))
+vv = variog(geo.data.1978,
+            trend = ~geo.data.1978$covar$z,
+            uvec=seq(0, 0.3*max.dist, length=20),
+            lambda=0,
+            messages=F)
+vv4 = variog4(geo.data.1978,
+             trend = ~geo.data.1978$covar$z,
+             uvec=seq(0, 0.3*max.dist, length=20),
+             lambda=0,
+             messages=F)
+
+plot(vv, type="b", lwd=2)
+title("Variogram")
+plot(vv4, lwd=2)
+title("Variogram in 4 directions")
+```
+
+#### Ordinary Kriging
+
+The covariance function chosen is the spherical one. The parameters chosen by inspection of the variogram are plugged-in and a cross-validation coefficient is computed to check if the fit of the model with the dataset is good.
+
+```{r}
+### Fit of the covariance function
+vv.model = likfit(geo.data.1978,
+                  trend = ~geo.data.1978$covar$z,
+                  ini.cov.pars=c(0.15, 100), 
+                  nugget=0.04, 
+                  cov.model="spherical", 
+                  messages=FALSE,
+                  lambda=0)
+
+CV.model = xvalid(geo.data.1978,
+                  model=vv.model,
+                  messages=FALSE)
+
+### CV coefficient
+mean(CV.model$std.error^2)
+```
+
+```{r ordinary kriging pred new, cache=T}
+### Ordinary Kriging
+out = output.control(quantile=c(0.025,0.5,0.975), messages=F)
+
+krig.par <- krige.control(type.krige='ok',
+                          cov.pars=vv.model$cov.pars,
+                          nugget=vv.model$nugget, 
+                          trend.d=~geo.data.1978$covar$z,
+                          trend.l=~grid[,3],
+                          cov.model = "spherical",
+                          lambda=0)
+
+pred.okrig <- krige.conv(geo.data.1978,
+                         locations=grid[,1:2],
+                         krige=krig.par, 
+                         output=out)
+
+### Kriging prediction dataset
+pred.okrig.1978 = cbind(grid[,1:2], 
+                        pred.okrig$predict, 
+                        pred.okrig$quantiles.simulations$q2.5,
+                        pred.okrig$quantiles.simulations$q50,
+                        pred.okrig$quantiles.simulations$q97.5)
+
+colnames(pred.okrig.1978) = c("x","y","value","lower","median","upper")
+```
+
+We can compare the values of the 1978 dataset with the ones obtain using the Ordinary Kriging algorithm, using both mean and median. 
+
+The summaries and the histograms shows that both mean and median distributions are similar to the original one, but the median has lower values. This behaviour is expected, because the lognormal distribution has $e^{\mu}$ as median and $e^{\mu + \frac{\sigma^2}{2}}$ as mean: the second one is always larger than the first one, given that $\sigma>0$.
+
+```{r}
+### Data 1978
+summary(data.1978$value)
+
+### Ordinary Kriging prediction mean
+summary(pred.okrig.1978$value)
+
+### Ordinary Kriging prediction median
+summary(pred.okrig.1978$median)
+```
+
+```{r}
+par(mfrow=c(2,2))
+hist(pred.okrig.1978$value, main="", xlim=c(0,2500), prob=T)
+title("Ordinary Kriging Mean")
+hist(pred.okrig.1978$value, main="", xlim=c(0,2500), prob=T)
+title("1978 Dataset")
+hist(pred.okrig.1978$median, main="", xlim=c(0,2500), prob=T)
+title("Ordinary Kriging Median")
+
+### 95% Confidence Interval Ordinary Kriging
+difference.okrig = pred.okrig.1978$upper - pred.okrig.1978$lower
+summary(difference.okrig)
+```
+
+```{r echo=FALSE}
+### Mean and CI plots
+ggplot() +
+  geom_path(data=calabria, aes(x=x, y=y), size=1, col="grey") +
+  geom_path(data=basilicata, aes(x=x, y=y), size=1, col="grey") +
+  geom_point(data=pred.okrig.1978, aes(x=x, y=y, col=value)) +
+  scale_color_viridis_c(limits=c(0,2600),
+                        begin=0.25)+
+  geom_point(data=data.1978, aes(x=x, y=y, col=value)) +
+  labs(title="Grid estimate - Ordinary Kriging 1978", 
+       x="x (km)", y="y (km)", fill="mm",
+       caption="rain value expressed in mm") +
+  theme_bw()
+
+ggplot() +
+  geom_path(data=basilicata, aes(x=x, y=y), size=1, col="grey") +
+  geom_path(data=calabria, aes(x=x, y=y), size=1, col="grey") +
+  geom_point(data=pred.okrig.1978, aes(x=x, y=y, col=upper-lower)) +
+  scale_color_viridis_c(option="plasma")+
+  geom_point(data=data.1978, aes(x=x, y=y), col="black", size=1) +
+  labs(title="CI length - Ordinary Kriging 1978", 
+       x="x (km)", y="y (km)", fill="mm",
+       caption="rain value expressed in mm") +
+  theme_bw()
+```
+
+### Residuals analysis
+
+If we analyze the confidence interval in the log-scale, we notice that the uncertainty is higher where the concentration of points is lower.
+
+```{r}
+### Fit of the covariance function
+vv.model = likfit(coords=data.1978[,1:2],
+                  data=rr1,
+                  ini.cov.par=c(0.15, 200), 
+                  nugget=0.06, 
+                  cov.model="spherical", 
+                  messages=FALSE)
+
+CV.model = xvalid(coords=data.1978[,1:2],
+                  data=rr1,
+                  model=vv.model,
+                  messages=FALSE)
+
+### CV coefficient
+mean(CV.model$std.error^2)
+```
+
+```{r rr ordinary kriging pred, cache=T}
+### Ordinary Kriging
+krig.par <- krige.control(type.krige='ok',
+                          cov.pars=vv.model$cov.pars,
+                          nugget=vv.model$nugget, 
+                           cov.model = "spherical")
+
+pred.okrig <- krige.conv(coords=data.1978[,1:2],
+                         data=rr1,
+                         locations=grid[,1:2],
+                         krige=krig.par, 
+                         output=out)
+
+### Kriging prediction dataset
+rr.pred.okrig.1978 = cbind(grid[,1:2], 
+                        pred.okrig$predict, 
+                        pred.okrig$quantiles.simulations$q2.5,
+                        pred.okrig$quantiles.simulations$q50,
+                        pred.okrig$quantiles.simulations$q97.5)
+
+colnames(rr.pred.okrig.1978) = c("x","y","value","lower","median","upper")
+```
+
+```{r}
+### 95% Confidence Interval Ordinary Kriging
+rr.difference.okrig = rr.pred.okrig.1978$upper - rr.pred.okrig.1978$lower
+```
+
+```{r}
+surf <- mba.surf(cbind(grid[,1:2], rr.difference.okrig), 
+                 no.X=300, no.Y=300)$xyz.est
+image.plot(surf, main="",
+           horizontal=F)
+lines(calabria, lty=2)
+lines(basilicata, lty=2)
+points(data.1978[,1],data.1978[,2])
+```
+
+The confidence intervals change if we go back in the original scale, because the variance of the log-normal distribution is higher where the mean has an high value.
+
+If $\sigma_l^2$ and $\mu_l$ are the variance and the mean in the log-scale, in the original scale the variance will be:
+
+$$
+\sigma ^2 =  exp \big( \sigma_l^2 \big) \cdot  exp 
+\big( 2 \mu_l + \sigma_l \big) 
+$$
+
+## Bayesian Kriging 1978
+
+We can perform the Kriging using an approximated Bayesian approach, specifying different levels of uncertainty in the model parameters. The results will be the posterior distributions for the model parameters and the predictive distributions for the provided locations.
+
+```{r bayes kriging}
+### Covariance function
+ctrl = model.control(trend.d=~geo.data.1978$covar$z,
+                      trend.l=~grid[,3],
+                      cov.model = "spherical",
+                      lambda=0)
+
+### Prior distribution for phi and tausq.rel
+prior.list = prior.control(phi.prior = "uniform",
+                         phi.discrete =seq(90,100,by=5),
+                         tausq.rel.prior ="uniform", 
+                         tausq.rel.discrete = seq(0.26,0.28,by=0.01))
+
+output=output.control(n.posterior=500, 
+                      messages=F)
+
+### Bayesian Kriging
+krig.b = krige.bayes(geo.data.1978, 
+                     model=ctrl, 
+                     prior=prior.list,
+                     output=output)
+par(mfrow=c(1,2))
+plot(krig.b, type="h")
+```
+
+```{r bayes kriging prediction, cache=T}
+### Bayes Kriging prediction
+output=output.control(n.posterior=500, n.predictive=500, 
+                      messages=F, quantile=c(0.025,0.975))
+
+krig.b=krige.bayes(geo.data.1978, 
+                   model=ctrl, 
+                   prior=prior.list,
+                   output=output,
+                   locations=grid[,1:2])
+```
+
+```{r}
+pred.krigb.1978 = cbind(grid[,1:2], 
+                    krig.b$predictive$mean, 
+                    krig.b$predictive$quantiles.simulations$q2.5,
+                    krig.b$predictive$quantiles.simulations$q97.5)
+colnames(pred.krigb.1978) = c("x","y","value","lower", "upper")
+
+### Data 1978 vs Bayesian Kriging prediction
+summary(pred.krigb.1978$value)
+summary(data.1978$value)
+
+
+### 95% Confidence interval Bayesian Kriging
+difference.bayes = pred.krigb.1978$upper - pred.krigb.1978$lower
+summary(difference.bayes)
+```
+
+```{r echo=FALSE}
+### Mean and CI plots
+ggplot() +
+  geom_path(data=calabria, aes(x=x, y=y), size=1, col="grey") +
+  geom_path(data=basilicata, aes(x=x, y=y), size=1, col="grey") +
+  geom_point(data=pred.krigb.1978, aes(x=x, y=y, col=value)) +
+  scale_color_viridis_c(limits=c(0,2600))+
+  geom_point(data=data.1978, aes(x=x, y=y, col=value)) +
+  ggtitle("Grid estimation - Bayesian Kriging 1978") +
+  theme_bw()
+
+ggplot() +
+  geom_path(data=basilicata, aes(x=x, y=y), size=1, col="grey") +
+  geom_path(data=calabria, aes(x=x, y=y), size=1, col="grey") +
+  geom_point(data=pred.krigb.1978, 
+             aes(x=x, y=y,col=upper-lower)) +
+  scale_color_viridis_c(option="plasma")+
+  geom_point(data=data.1978, aes(x=x, y=y), col="black", size=1) +
+  ggtitle("CI length - Bayesian Kriging 1978") +
+  theme_bw()
+```
+
+## Splm
+
+Now we'll use a Full Bayesian approach, without approximations.
+
+As we did in the previous computations, we assume that each point is a realization of a gaussian process with mean $z \times \beta$, residuals $W(s)$ comprising a spatial process and normal independent white-noise $\epsilon(s)$, with $s \in R^3$ that captures measurement errors.  
+
+We assume second order stationarity in order to simplify the covariance structure and exploit the variogram to choose the parameters for the spLM function.
+
+The spLM function works on the statistical setting that we just described and implement a MCMC algorithm. Given prior distributions for the covariance function, initial values and the hyperparameters, the output is the posterior distribution of those parameters. The sampling of the posterior is conducted exploiting Gibbs sampling and Metropolis algorithms, hence a proposal variance in the tuning option must be provided.
+
+```{r splm posterior, cache=T}
+n.samples = 60000
+post.splm.1978 <- spLM(log(data.1978$value)~data.1978$z, 
+            coords=as.matrix(data.1978[,1:2]),
+            starting=list("phi"=0.0105, 
+                          "sigma.sq"=0.15,
+                          "tau.sq"=0.04),
+            tuning=list("phi"=0.2, "sigma.sq"=0.1, "tau.sq"=0.01),
+            priors=list("phi.unif"=c(0.01, 0.15), 
+                        "sigma.sq.IG"=c(2, 0.14), 
+                        "tau.sq.IG"=c(2, 0.04)),
+            cov.model="spherical", n.samples=n.samples, verbose=F)
+
+### Acceptance rate
+mean(post.splm.1978$acceptance)
+
+### Traceplots and posterior distributions
+plot(post.splm.1978$p.theta.samples)
+```
+
+The prediction chunk is not included in this presentation to avoid the output messages. The prediction is computed with a 15% burn-in and thinning equal to 10.
+
+```{r splm predict, message=FALSE, cache=T, include=FALSE}
+### Prediction
+pred.coords <- grid[,1:2]
+pred.covars <- cbind(1, grid[,3])
+splm.1978 <- spPredict(post.splm.1978, pred.covars=pred.covars, 
+                      pred.coords=pred.coords, start=0.25*n.samples, 
+                      thin=10, verbose=F)
+```
+
+```{r}
+### spLM prediction
+pred.splm.1978 <- apply(exp(splm.1978$p.y.predictive.samples), 
+                        1, mean)
+
+### quantile
+quant = t(apply(exp(splm.1978$p.y.predictive.samples), 1, quantile,
+            probs=c(0.025,0.975)))
+
+pred.splm.1978 = data.frame(grid[,1:2],pred.splm.1978,quant)
+colnames(pred.splm.1978) = c("x","y","value","lower","upper")
+
+### Data 1978 vs spLM prediction
+summary(data.1978$value)
+summary(pred.splm.1978$value)
+
+### 95% Confidence Interval spLM 1978
+difference.splm = quant[,2]-quant[,1]
+summary(difference.splm)
+```
+
+```{r echo=FALSE}
+### Mean and CI plots
+ggplot() +
+  geom_path(data=basilicata, aes(x=x, y=y), size=1, col="grey") +
+  geom_path(data=calabria, aes(x=x, y=y), size=1, col="grey") +
+  geom_point(data=pred.splm.1978, aes(x=x, y=y, col=value)) +
+  scale_color_viridis_c(limits=c(0,2600))+
+  geom_point(data=data.1978, aes(x=x, y=y, col=value)) +
+  ggtitle("Grid estimate - spLM 1978") +
+  theme_bw()
+
+ggplot() +
+  geom_path(data=basilicata, aes(x=x, y=y), size=1, col="grey") +
+  geom_path(data=calabria, aes(x=x, y=y), size=1, col="grey") +
+  geom_point(data=pred.splm.1978, aes(x=x, y=y, col=upper-lower)) +
+  scale_color_viridis_c(option="plasma")+
+  geom_point(data=data.1978, aes(x=x, y=y), col="black", size=1) +
+  ggtitle("CI length - spLM 1978") +
+  theme_bw()
+```
+
+## Confidence Interval and Credibility Interval comparison
+
+The predicted values are similar to each other.
+
+A simple inspection of the confidence interval of the 3 algorithms used to reconstruct the grid of values suggest that the Bayesian Kriging is the best approach. This is due to the narrower confidence intervals provided for the prediction.
+
+```{r echo=FALSE}
+### Prediction Surface
+par(mfrow=c(1,2))
+surf <- mba.surf(cbind(grid[,1:2], pred.okrig.1978$value), 
+                 no.X=300, no.Y=300, extend=T)$xyz.est
+image.plot(surf, main="Pred. Ordinary Krig. 1978", zlim=c(0,2600),
+           horizontal=T)
+lines(calabria, lty=2)
+lines(basilicata, lty=2)
+
+surf <- mba.surf(cbind(grid[,1:2], pred.krigb.1978$value), 
+                 no.X=300, no.Y=300, extend=T)$xyz.est
+image.plot(surf, main="Pred. Approx. Bayesian Krig.1978", zlim=c(0,2600),
+           horizontal=T)
+lines(calabria, lty=2)
+lines(basilicata, lty=2)
+
+surf <- mba.surf(cbind(pred.coords, pred.splm.1978$value), 
+                 no.X=300, no.Y=300, extend=T)$xyz.est
+image.plot(surf, main="Pred. splm 1978", zlim=c(0,2600),
+           horizontal=T)
+lines(calabria, lty=2)
+lines(basilicata, lty=2)
+```
+
+
+```{r}
+### Prediction summaries
+summary(data.1978$value)
+summary(pred.okrig.1978$value)
+summary(pred.krigb.1978$value)
+summary(pred.splm.1978$value)
+```
+
+```{r}
+### Prediction Histograms
+par(mfrow=c(2,2))
+hist(pred.okrig.1978$value, main="", xlim=c(0,2600), prob=T)
+title("Value dataset 1978")
+hist(pred.okrig.1978$value, main="", xlim=c(0,2600), prob=T)
+title("Prediction Ordinary Krig. 1978")
+hist(pred.krigb.1978$value, main="", xlim=c(0,2600), prob=T)
+title("Prediction Approx. Bayesian Krig. 1978")
+hist(pred.splm.1978$value, main="", xlim=c(0,2600), prob=T)
+title("Prediction splm 1978")
+```
+
+```{r}
+### CI Ordinary Kriging 1978
+summary(difference.okrig)
+
+### CI Bayesian Kriging 1978
+summary(difference.bayes)
+
+### CI spLM 1978
+summary(difference.splm)
+```
+
+```{r echo=FALSE}
+### CI comparison - Surface plots
+par(mfrow=c(1,2))
+surf <- mba.surf(cbind(pred.coords, difference.okrig), 
+                 no.X=250, no.Y=250, extend=T)$xyz.est
+image.plot(surf, main="CI Ordinary Kriging", zlim=c(200,2650),
+           horizontal=T)
+lines(calabria, lty=2)
+lines(basilicata, lty=2)
+
+surf <- mba.surf(cbind(pred.coords, difference.bayes), 
+                 no.X=250, no.Y=250, extend=T)$xyz.est
+image.plot(surf, main="CI Bayesian Kriging", zlim=c(200,2650),
+           horizontal=T)
+lines(calabria, lty=2)
+lines(basilicata, lty=2)
+
+surf <- mba.surf(cbind(pred.coords, difference.splm), 
+                 no.X=250, no.Y=250, extend=T)$xyz.est
+image.plot(surf, main="CI splm", zlim=c(200,2650),
+           horizontal=T)
+lines(calabria, lty=2)
+lines(basilicata, lty=2)
+```
+
+```{r echo=FALSE}
+par(mfrow=c(2,2))
+hist(difference.okrig, xlim=c(0,2700), prob=T)
+hist(difference.bayes, xlim=c(0,2700), prob=T)
+hist(difference.splm, xlim=c(0,2700), prob=T)
+```
+
+## Year 1981
+
+The exact same analysis will be performed for the year 1981 using only the approximated Bayesian approach.
+
+```{r}
+### dataset 1981
+data.1981 = data.frame(dati$XUTM, dati$YUTM, dati$Quota, 
+                      dati$totanno, dati$anno, dati$Nome_Regione)
+colnames(data.1981) = c("x", "y", "z", "value", "year", "regione")
+
+### extracting rows for 1981, Puglia and Calabria
+data.1981 = data.1981[which((data.1981[5]==1981) & 
+                      (data.1981[6]=="Basilicata" | data.1981[6] =="Calabria")),]
+
+### deleting year and region columns, useless for the analysis
+data.1981 = data.1981[-c(5,6)]
+data.1981[,1:3] = data.1981[,1:3]/1000
+row.names(data.1981) = NULL
+str(data.1981)
+
+### Creating Geodata
+geo.data.1981 = as.geodata(obj=data.1981,
+                           coords=c(1,2),
+                           data.col=4,
+                           covar.col=3,
+                           covar.names=c("z"))
+```
+
+```{r bayes kriging 2}
+### Covariance function
+ctrl = model.control(trend.d=~geo.data.1981$covar$z,
+                      trend.l=~grid[,3],
+                      cov.model = "spherical",
+                      lambda=0)
+
+### Prior distribution for phi and tausq.rel
+prior.list = prior.control(phi.prior = "uniform",
+                         phi.discrete =seq(260,270,by=5),
+                         tausq.rel.prior ="uniform", 
+                         tausq.rel.discrete = seq(0.125,0.145,by=0.01))
+
+output=output.control(n.posterior=500, 
+                      messages=F)
+
+### Bayesian Kriging
+krig.b = krige.bayes(geo.data.1981, 
+                     model=ctrl, 
+                     prior=prior.list,
+                     output=output)
+par(mfrow=c(1,2))
+plot(krig.b, type="h")
+```
+
+```{r bayes kriging prediction 2, cache=T}
+### Bayes Kriging prediction
+output=output.control(n.posterior=500, n.predictive=500, 
+                      messages=F, quantile=c(0.025,0.975))
+
+krig.b=krige.bayes(geo.data.1981, 
+                   model=ctrl, 
+                   prior=prior.list,
+                   output=output,
+                   locations=grid[,1:2])
+```
+
+
+```{r}
+pred.krigb.1981 = cbind(grid[,1:2], 
+                    krig.b$predictive$mean, 
+                    krig.b$predictive$quantiles.simulations$q2.5,
+                    krig.b$predictive$quantiles.simulations$q97.5)
+colnames(pred.krigb.1981) = c("x","y","value","lower", "upper")
+
+### Data 1981 vs Bayesian Kriging prediction
+summary(data.1981$value)
+summary(pred.krigb.1981$value)
+
+
+### 95% Confidence interval Bayesian Kriging
+difference.bayes = pred.krigb.1981$upper - pred.krigb.1981$lower
+summary(difference.bayes)
+```
+
+```{r echo=FALSE}
+### Mean and CI plots
+ggplot() +
+  geom_path(data=calabria, aes(x=x, y=y), size=1, col="grey") +
+  geom_path(data=basilicata, aes(x=x, y=y), size=1, col="grey") +
+  geom_point(data=pred.krigb.1981, aes(x=x, y=y, col=value)) +
+  scale_color_viridis_c(limits=c(0,2600))+
+  geom_point(data=data.1981, aes(x=x, y=y, col=value)) +
+  ggtitle("Grid estimation - Bayesian Kriging 1981") +
+  theme_bw()
+
+ggplot() +
+  geom_path(data=basilicata, aes(x=x, y=y), size=1, col="grey") +
+  geom_path(data=calabria, aes(x=x, y=y), size=1, col="grey") +
+  geom_point(data=pred.krigb.1981, 
+             aes(x=x, y=y,col=upper-lower)) +
+  scale_color_viridis_c(option="plasma")+
+  geom_point(data=data.1981, aes(x=x, y=y), col="black", size=1) +
+  ggtitle("CI length - Bayesian Kriging 1981") +
+  theme_bw()
+```
+
+## Comparison between 1978 and 1981
+
+```{r}
+### Prediction Surface
+par(mfrow=c(1,2))
+surf <- mba.surf(cbind(grid[,1:2], pred.krigb.1978$value), 
+                 no.X=300, no.Y=300, extend=T)$xyz.est
+image.plot(surf, main="Pred.Approx.Bayesian Krig.1978", zlim=c(0,2600),
+           horizontal=T)
+lines(calabria, lty=2)
+lines(basilicata, lty=2)
+
+surf <- mba.surf(cbind(grid[,1:2], pred.krigb.1981$value), 
+                 no.X=300, no.Y=300, extend=T)$xyz.est
+image.plot(surf, main="Pred.Approx.Bayesian Krig.1981", zlim=c(0,2600),
+           horizontal=T)
+lines(calabria, lty=2)
+lines(basilicata, lty=2)
+
+surf <- mba.surf(cbind(grid[,1:2], pred.okrig.1978$value-pred.krigb.1981$value), 
+                 no.X=300, no.Y=300, extend=T)$xyz.est
+image.plot(surf, main="Difference between 1978 and 1981",
+           horizontal=T)
+lines(calabria, lty=2)
+lines(basilicata, lty=2)
+```
+
+
+
+
+
+
+
+
+
+
+
+
